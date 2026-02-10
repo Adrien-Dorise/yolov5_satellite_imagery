@@ -57,6 +57,12 @@ from utils.general import (
 )
 from utils.torch_utils import torch_distributed_zero_first
 
+import sys
+sys.path.insert(0,"/workspace/my_model")
+
+from src.preprocess.wavelet import dwt_to_4c 
+
+
 # Parameters
 HELP_URL = "See https://docs.ultralytics.com/yolov5/tutorials/train_custom_data"
 IMG_FORMATS = "bmp", "dng", "jpeg", "jpg", "mpo", "png", "tif", "tiff", "webp", "pfm"  # include image suffixes
@@ -174,6 +180,7 @@ def create_dataloader(
     prefix="",
     shuffle=False,
     seed=0,
+    wavelet=False
 ):
     """Creates and returns a configured DataLoader instance for loading and processing image datasets."""
     if rect and shuffle:
@@ -194,6 +201,7 @@ def create_dataloader(
             image_weights=image_weights,
             prefix=prefix,
             rank=rank,
+            wavelet=wavelet
         )
 
     batch_size = min(batch_size, len(dataset))
@@ -551,6 +559,7 @@ class LoadImagesAndLabels(Dataset):
         prefix="",
         rank=-1,
         seed=0,
+        wavelet=False
     ):
         """Initializes the YOLOv5 dataset loader, handling images and their labels, caching, and preprocessing."""
         self.img_size = img_size
@@ -564,6 +573,8 @@ class LoadImagesAndLabels(Dataset):
         self.path = path
         self.albumentations = Albumentations(size=img_size) if augment else None
 
+        self.wavelet = wavelet
+        
         try:
             f = []  # image files
             for p in path if isinstance(path, list) else [path]:
@@ -694,6 +705,7 @@ class LoadImagesAndLabels(Dataset):
                     pbar.desc = f"{prefix}Caching images ({b / gb:.1f}GB {cache_images})"
                 pbar.close()
 
+
     def check_cache_ram(self, safety_margin=0.1, prefix=""):
         """Checks if available RAM is sufficient for caching images, adjusting for a safety margin."""
         b, gb = 0, 1 << 30  # bytes of cached images, bytes per gigabytes
@@ -768,6 +780,8 @@ class LoadImagesAndLabels(Dataset):
         index = self.indices[index]  # linear, shuffled, or image_weights
 
         hyp = self.hyp
+
+        self.mosaic = False
         if mosaic := self.mosaic and random.random() < hyp["mosaic"]:
             # Load mosaic
             img, labels = self.load_mosaic(index)
@@ -779,18 +793,28 @@ class LoadImagesAndLabels(Dataset):
 
         else:
             # Load image
-            img, (h0, w0), (h, w) = self.load_image(index)
+            img0, (h0, w0), (h, w) = self.load_image(index)
 
-            # Letterbox
-            shape = self.batch_shapes[self.batch[index]] if self.rect else self.img_size  # final letterboxed shape
-            img, ratio, pad = letterbox(img, shape, auto=False, scaleup=self.augment)
-            shapes = (h0, w0), ((h / h0, w / w0), pad)  # for COCO mAP rescaling
+            # Letterbox for YOLO (this defines the label space!)
+            shape = self.batch_shapes[self.batch[index]] if self.rect else self.img_size
+            img, ratio, pad = letterbox(img0, shape, auto=False, scaleup=self.augment)
 
+            # Optional: wavelet branch at 2x resolution (only used to compute DWT -> half -> matches img)
+            if self.wavelet:
+                img_up,_,_ = self.load_image(index,self.img_size * 2)
+                img_up, _, _ = letterbox(img_up, self.img_size * 2, auto=False, scaleup=self.augment)
+            else:
+                img_up = None
+
+            # shapes must match the YOLO branch for correct mAP rescaling
+            shapes = (h0, w0), ((h / h0, w / w0), pad)
+
+            # Labels (computed in YOLO image space)
             labels = self.labels[index].copy()
             if labels.size:  # normalized xywh to pixel xyxy format
                 labels[:, 1:] = xywhn2xyxy(labels[:, 1:], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1])
 
-            if self.augment:
+            if False:
                 img, labels = random_perspective(
                     img,
                     labels,
@@ -801,27 +825,31 @@ class LoadImagesAndLabels(Dataset):
                     perspective=hyp["perspective"],
                 )
 
-        nl = len(labels)  # number of labels
+        nl = len(labels)
         if nl:
             labels[:, 1:5] = xyxy2xywhn(labels[:, 1:5], w=img.shape[1], h=img.shape[0], clip=True, eps=1e-3)
 
         if self.augment:
             # Albumentations
-            img, labels = self.albumentations(img, labels)
-            nl = len(labels)  # update after albumentations
+            #img, labels = self.albumentations(img, labels)
+            #nl = len(labels)  # update after albumentations
 
             # HSV color-space
-            augment_hsv(img, hgain=hyp["hsv_h"], sgain=hyp["hsv_s"], vgain=hyp["hsv_v"])
+            #augment_hsv(img, hgain=hyp["hsv_h"], sgain=hyp["hsv_s"], vgain=hyp["hsv_v"])
 
             # Flip up-down
             if random.random() < hyp["flipud"]:
                 img = np.flipud(img)
+                if self.wavelet:
+                    img_up = np.flipud(img_up)
                 if nl:
                     labels[:, 2] = 1 - labels[:, 2]
 
             # Flip left-right
             if random.random() < hyp["fliplr"]:
                 img = np.fliplr(img)
+                if self.wavelet:
+                    img_up = np.fliplr(img_up)
                 if nl:
                     labels[:, 1] = 1 - labels[:, 1]
 
@@ -830,38 +858,62 @@ class LoadImagesAndLabels(Dataset):
             # nl = len(labels)  # update after cutout
 
         labels_out = torch.zeros((nl, 6))
+        # Check if targets out of normalisation
+        #t = labels_out  # [N,6] (img_idx, cls, x, y, w, h)
+        #if t.numel():
+        #    x, y, w, h = t[:,2], t[:,3], t[:,4], t[:,5]
+        #    if (w <= 0).any() or (h <= 0).any():
+        #        raise RuntimeError("Found zero/negative width/height in targets")
+        #    if (x < 0).any() or (x > 1).any() or (y < 0).any() or (y > 1).any():
+        #        raise RuntimeError("Found out-of-range x/y in targets")
+        #    if (w > 1).any() or (h > 1).any():
+        #        raise RuntimeError("Found out-of-range w/h in targets")
         if nl:
             labels_out[:, 1:] = torch.from_numpy(labels)
 
         # Convert
         img = img.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
         img = np.ascontiguousarray(img)
+        img_t = torch.from_numpy(img)  # uint8 [3,H,W]
 
-        return torch.from_numpy(img), labels_out, self.im_files[index], shapes
+        # Convert wavelet image if present
+        if img_up is not None:
+            img_up = img_up.transpose((2, 0, 1))[::-1]
+            img_up = np.ascontiguousarray(img_up)
+            img_up_t = torch.from_numpy(img_up)  # uint8 [3,2H,2W]
+        else:
+            img_up_t = torch.empty(0)  # or None, but collate must handle it
 
-    def load_image(self, i):
+        return img_t, img_up_t, labels_out, self.im_files[index], shapes
+
+    def load_image(self, i, img_size=None):
         """Loads an image by index, returning the image, its original dimensions, and resized dimensions.
 
         Returns (im, original hw, resized hw)
         """
+        if not img_size:
+            img_size = self.img_size 
+
+
         im, f, fn = (
             self.ims[i],
             self.im_files[i],
             self.npy_files[i],
         )
-        if im is None:  # not cached in RAM
+        if im is not None:
+            return self.ims[i], self.im_hw0[i], self.im_hw[i]  # im, hw_original, hw_resized
+        else:  # not cached in RAM
             if fn.exists():  # load npy
                 im = np.load(fn)
             else:  # read image
                 im = cv2.imread(f)  # BGR
                 assert im is not None, f"Image Not Found {f}"
             h0, w0 = im.shape[:2]  # orig hw
-            r = self.img_size / max(h0, w0)  # ratio
+            r = img_size / max(h0, w0)  # ratio
             if r != 1:  # if sizes are not equal
                 interp = cv2.INTER_LINEAR if (self.augment or r > 1) else cv2.INTER_AREA
                 im = cv2.resize(im, (math.ceil(w0 * r), math.ceil(h0 * r)), interpolation=interp)
             return im, (h0, w0), im.shape[:2]  # im, hw_original, hw_resized
-        return self.ims[i], self.im_hw0[i], self.im_hw[i]  # im, hw_original, hw_resized
 
     def cache_images_to_disk(self, i):
         """Saves an image to disk as an *.npy file for quicker loading, identified by index `i`."""
@@ -1013,15 +1065,15 @@ class LoadImagesAndLabels(Dataset):
     @staticmethod
     def collate_fn(batch):
         """Batches images, labels, paths, and shapes, assigning unique indices to targets in merged label tensor."""
-        im, label, path, shapes = zip(*batch)  # transposed
+        im, img_up, label, path, shapes = zip(*batch)  # transposed
         for i, lb in enumerate(label):
             lb[:, 0] = i  # add target image index for build_targets()
-        return torch.stack(im, 0), torch.cat(label, 0), path, shapes
+        return torch.stack(im, 0), torch.stack(img_up,0), torch.cat(label, 0), path, shapes
 
     @staticmethod
     def collate_fn4(batch):
         """Bundles a batch's data by quartering the number of shapes and paths, preparing it for model input."""
-        im, label, path, shapes = zip(*batch)  # transposed
+        im, im_up, label, path, shapes = zip(*batch)  # transposed
         n = len(shapes) // 4
         im4, label4, path4, shapes4 = [], [], path[:n], shapes[:n]
 
@@ -1044,7 +1096,7 @@ class LoadImagesAndLabels(Dataset):
         for i, lb in enumerate(label4):
             lb[:, 0] = i  # add target image index for build_targets()
 
-        return torch.stack(im4, 0), torch.cat(label4, 0), path4, shapes4
+        return torch.stack(im4, 0), None, torch.cat(label4, 0), path4, shapes4
 
 
 # Ancillary functions --------------------------------------------------------------------------------------------------

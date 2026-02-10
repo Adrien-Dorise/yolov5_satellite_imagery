@@ -60,6 +60,10 @@ from utils.metrics import ConfusionMatrix, ap_per_class, box_iou
 from utils.plots import output_to_target, plot_images, plot_val_study
 from utils.torch_utils import select_device, smart_inference_mode
 
+import sys
+sys.path.insert(0,"/workspace/my_model")
+from src.preprocess.wavelet import dwt_to_4c, append_wavelet_channels 
+
 
 def save_one_txt(predn, save_conf, shape, file):
     """Saves one detection result to a txt file in normalized xywh format, optionally including confidence.
@@ -211,6 +215,7 @@ def run(
     plots=True,
     callbacks=Callbacks(),
     compute_loss=None,
+    wavelet_parameters=[False,"db1","bilinear"]
 ):
     """Evaluates a YOLOv5 model on a dataset and logs performance metrics.
 
@@ -279,6 +284,11 @@ def run(
         # Data
         data = check_dataset(data)  # check
 
+    # Wavelet
+    wavelet = wavelet_parameters[0]
+    wavelet_name = wavelet_parameters[1]
+    wavelet_upsample = wavelet_parameters[2]
+
     # Configure
     model.eval()
     cuda = device.type != "cpu"
@@ -297,6 +307,7 @@ def run(
             )
         model.warmup(imgsz=(1 if pt else batch_size, 3, imgsz, imgsz))  # warmup
         pad, rect = (0.0, False) if task == "speed" else (0.5, pt)  # square inference for benchmarks
+        rect = False
         task = task if task in ("train", "val", "test") else "val"  # path to train/val/test images
         dataloader = create_dataloader(
             data[task],
@@ -323,7 +334,7 @@ def run(
     jdict, stats, ap, ap_class = [], [], [], []
     callbacks.run("on_val_start")
     pbar = tqdm(dataloader, desc=s, bar_format=TQDM_BAR_FORMAT)  # progress bar
-    for batch_i, (im, targets, paths, shapes) in enumerate(pbar):
+    for batch_i, (im, im_up, targets, paths, shapes) in enumerate(pbar):
         callbacks.run("on_val_batch_start")
         with dt[0]:
             if cuda:
@@ -332,6 +343,15 @@ def run(
             im = im.half() if half else im.float()  # uint8 to fp16/32
             im /= 255  # 0 - 255 to 0.0 - 1.0
             nb, _, height, width = im.shape  # batch size, channels, height, width
+
+                        
+            if wavelet:
+                if cuda:
+                    im_up = im_up.to(device, non_blocking=True)
+                im_up = im_up.half() if half else im_up.float()  # uint8 to fp16/32
+                im_up /= 255  # 0 - 255 to 0.0 - 1.0
+                im = append_wavelet_channels(im_up,x_to_cat=im,wavelet_name=wavelet_name, upsample_type=wavelet_upsample)
+
 
         # Inference
         with dt[1]:

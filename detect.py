@@ -158,7 +158,8 @@ def run(
 
     # Directories
     save_dir = increment_path(Path(project) / name, exist_ok=exist_ok)  # increment run
-    (save_dir / "labels" if save_txt else save_dir).mkdir(parents=True, exist_ok=True)  # make dir
+    if not nosave:
+        (save_dir / "labels" if save_txt else save_dir).mkdir(parents=True, exist_ok=True)  # make dir
 
     # Load model
     device = select_device(device)
@@ -241,6 +242,9 @@ def run(
             gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]  # normalization gain whwh
             imc = im0.copy() if save_crop else im0  # for save_crop
             annotator = Annotator(im0, line_width=line_thickness, example=str(names))
+            result_detection = {"bbox_xyxy": [],
+                                "confidence": [],
+                                "class_id": []}
             if len(det):
                 # Rescale boxes from img_size to im0 size
                 det[:, :4] = scale_boxes(im.shape[2:], det[:, :4], im0.shape).round()
@@ -256,6 +260,11 @@ def run(
                     label = names[c] if hide_conf else f"{names[c]}"
                     confidence = float(conf)
                     confidence_str = f"{confidence:.2f}"
+
+                    cls_i = int(cls)
+                    result_detection["bbox_xyxy"].append([float(x) for x in xyxy])
+                    result_detection["confidence"].append(float(conf))
+                    result_detection["class_id"].append(cls_i)
 
                     if save_csv:
                         write_to_csv(p.name, label, confidence_str)
@@ -319,6 +328,7 @@ def run(
     if update:
         strip_optimizer(weights[0])  # update model (to fix SourceChangeWarning)
 
+    return result_detection
 
 def parse_opt():
     """Parse command-line arguments for YOLOv5 detection, allowing custom inference options and model configurations.

@@ -14,6 +14,8 @@ Datasets:   https://github.com/ultralytics/yolov5/tree/master/data
 Tutorial:   https://docs.ultralytics.com/yolov5/tutorials/train_custom_data
 """
 
+DEBUG = False
+
 import argparse
 import math
 import os
@@ -96,6 +98,11 @@ from utils.torch_utils import (
     torch_distributed_zero_first,
 )
 
+import sys
+sys.path.insert(0,"/workspace/my_model")
+from src.preprocess.wavelet import dwt_to_4c, append_wavelet_channels 
+
+
 LOCAL_RANK = int(os.getenv("LOCAL_RANK", -1))  # https://pytorch.org/docs/stable/elastic/run.html
 RANK = int(os.getenv("RANK", -1))
 WORLD_SIZE = int(os.getenv("WORLD_SIZE", 1))
@@ -136,7 +143,7 @@ def train(hyp, opt, device, callbacks):
     Notes:
         Models and datasets download automatically from the latest YOLOv5 release.
     """
-    save_dir, epochs, batch_size, weights, single_cls, evolve, data, cfg, resume, noval, nosave, workers, freeze = (
+    save_dir, epochs, batch_size, weights, single_cls, evolve, data, cfg, resume, noval, nosave, workers, freeze, wavelet, lr_user = (
         Path(opt.save_dir),
         opt.epochs,
         opt.batch_size,
@@ -150,8 +157,11 @@ def train(hyp, opt, device, callbacks):
         opt.nosave,
         opt.workers,
         opt.freeze,
+        opt.wavelet,
+        opt.lr_user
     )
     callbacks.run("on_pretrain_routine_start")
+    
 
     # Directories
     w = save_dir / "weights"  # weights dir
@@ -164,9 +174,21 @@ def train(hyp, opt, device, callbacks):
             hyp = yaml.safe_load(f)  # load hyps dict
     LOGGER.info(colorstr("hyperparameters: ") + ", ".join(f"{k}={v}" for k, v in hyp.items()))
     opt.hyp = hyp.copy()  # for saving hyps to checkpoints
+    hyp['lr0'] = lr_user
+
+    # Wavelet
+    input_channels = 6 if wavelet else 3
+    wavelet_name = "db1"
+    wavelet_upsample_mode = "None"  # or "nearest"
+    wavelet_parameters = [wavelet,wavelet_name,wavelet_upsample_mode]
+
 
     # Save run settings
     if not evolve:
+        hyp["input_channels"] = input_channels
+        hyp["wavelet"] = wavelet
+        hyp["wavelet_name"] = wavelet_name
+        hyp["wavelet_upsample_mode"] = wavelet_upsample_mode
         yaml_save(save_dir / "hyp.yaml", hyp)
         yaml_save(save_dir / "opt.yaml", vars(opt))
 
@@ -215,14 +237,14 @@ def train(hyp, opt, device, callbacks):
         with torch_distributed_zero_first(LOCAL_RANK):
             weights = attempt_download(weights)  # download if not found locally
         ckpt = torch_load(weights, map_location="cpu")  # load checkpoint to CPU to avoid CUDA memory leak
-        model = Model(cfg or ckpt["model"].yaml, ch=3, nc=nc, anchors=hyp.get("anchors")).to(device)  # create
+        model = Model(cfg or ckpt["model"].yaml, ch=input_channels, nc=nc, anchors=hyp.get("anchors")).to(device)  # create
         exclude = ["anchor"] if (cfg or hyp.get("anchors")) and not resume else []  # exclude keys
         csd = ckpt["model"].float().state_dict()  # checkpoint state_dict as FP32
         csd = intersect_dicts(csd, model.state_dict(), exclude=exclude)  # intersect
         model.load_state_dict(csd, strict=False)  # load
         LOGGER.info(f"Transferred {len(csd)}/{len(model.state_dict())} items from {weights}")  # report
     else:
-        model = Model(cfg, ch=3, nc=nc, anchors=hyp.get("anchors")).to(device)  # create
+        model = Model(cfg, ch=input_channels, nc=nc, anchors=hyp.get("anchors")).to(device)  # create
     amp = check_amp(model)  # check AMP
 
     # Freeze
@@ -238,6 +260,7 @@ def train(hyp, opt, device, callbacks):
     gs = max(int(model.stride.max()), 32)  # grid size (max stride)
     imgsz = check_img_size(opt.imgsz, gs, floor=gs * 2)  # verify imgsz is gs-multiple
 
+
     # Batch size
     if RANK == -1 and batch_size == -1:  # single-GPU only, estimate best batch size
         batch_size = check_train_batch_size(model, imgsz, amp)
@@ -247,7 +270,7 @@ def train(hyp, opt, device, callbacks):
     nbs = 64  # nominal batch size
     accumulate = max(round(nbs / batch_size), 1)  # accumulate loss before optimizing
     hyp["weight_decay"] *= batch_size * accumulate / nbs  # scale weight_decay
-    optimizer = smart_optimizer(model, opt.optimizer, hyp["lr0"], hyp["momentum"], hyp["weight_decay"])
+    optimizer = smart_optimizer(model, opt.optimizer, lr_user, hyp["momentum"], hyp["weight_decay"])
 
     # Scheduler
     if opt.cos_lr:
@@ -283,6 +306,7 @@ def train(hyp, opt, device, callbacks):
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model).to(device)
         LOGGER.info("Using SyncBatchNorm()")
 
+
     # Trainloader
     train_loader, dataset = create_dataloader(
         train_path,
@@ -301,14 +325,16 @@ def train(hyp, opt, device, callbacks):
         prefix=colorstr("train: "),
         shuffle=True,
         seed=opt.seed,
+        wavelet=wavelet,
     )
     labels = np.concatenate(dataset.labels, 0)
     mlc = int(labels[:, 0].max())  # max label class
     assert mlc < nc, f"Label class {mlc} exceeds nc={nc} in {data}. Possible class labels are 0-{nc - 1}"
 
     # Process 0
+    
     if RANK in {-1, 0}:
-        val_loader = create_dataloader(
+        val_loader, val_dataset = create_dataloader(
             val_path,
             imgsz,
             batch_size // WORLD_SIZE * 2,
@@ -316,12 +342,13 @@ def train(hyp, opt, device, callbacks):
             single_cls,
             hyp=hyp,
             cache=None if noval else opt.cache,
-            rect=True,
+            rect=False,
             rank=-1,
             workers=workers * 2,
             pad=0.5,
             prefix=colorstr("val: "),
-        )[0]
+            wavelet=wavelet
+        )
 
         if not resume:
             if not opt.noautoanchor:
@@ -386,11 +413,50 @@ def train(hyp, opt, device, callbacks):
         if RANK in {-1, 0}:
             pbar = tqdm(pbar, total=nb, bar_format=TQDM_BAR_FORMAT)  # progress bar
         optimizer.zero_grad()
-        for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
+        for i, (imgs, imgs_up, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
             callbacks.run("on_train_batch_start")
             ni = i + nb * epoch  # number integrated batches (since train start)
-            imgs = imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
+            imgs = imgs.to(device, non_blocking=True)
+            if imgs.dtype == torch.uint8:
+                imgs = imgs.float() / 255
+            
+            if DEBUG:
+                def check_finite(name, t):
+                    if not torch.isfinite(t).all():
+                        print(f"[NaN/Inf] {name}:", {
+                            "min": float(t.nanmin()),
+                            "max": float(t.nanmax()),
+                            "mean": float(torch.nanmean(t)),
+                        })
+                        return False
+                    return True
+                
+                def params_finite(m):
+                    for n, p in m.named_parameters():
+                        if p is not None and (not torch.isfinite(p).all()):
+                            print("NON-FINITE PARAM:", n)
+                            return False
+                    return True
+                
+                def first_nonfinite_named(tensors):
+                    for name, t in tensors:
+                        if t is None:
+                            continue
+                        if not torch.isfinite(t).all():
+                            return name, t
+                    return None, None
 
+
+            if wavelet:
+                imgs_up = imgs_up.to(device, non_blocking=True)
+                imgs_up = imgs_up.float() / 255
+                imgs = append_wavelet_channels(imgs_up, x_to_cat=imgs, wavelet_name=wavelet_name, upsample_type=wavelet_upsample_mode)
+
+            # after wavelet
+            if wavelet and DEBUG:
+                if not check_finite("imgs_wavelet", imgs):
+                    print("paths[0:4] =", paths[:4])
+                    raise RuntimeError("Non-finite wavelet input")
             # Warmup
             if ni <= nw:
                 xi = [0, nw]  # x interp
@@ -419,16 +485,54 @@ def train(hyp, opt, device, callbacks):
                 if opt.quad:
                     loss *= 4.0
 
+            # after loss
+            if DEBUG:
+                if not torch.isfinite(loss):
+                    print("\n=== NON-FINITE LOSS ===")
+                    print("epoch", epoch, "iter", i, "ni", ni)
+                    print("loss_items (box,obj,cls):", loss_items.detach().cpu().numpy())
+                    print("targets:", targets.shape, "num_targets:", int(targets.shape[0]))
+                    print("imgs:", imgs.shape, imgs.dtype,
+                        "min/max:", float(imgs.min()), float(imgs.max()))
+                    # preds quick check
+                    if isinstance(pred, (list, tuple)):
+                        for k, p in enumerate(pred):
+                            print(f"pred[{k}]:", p.shape, p.dtype,
+                                "finite:", bool(torch.isfinite(p).all()),
+                                "min/max:", float(torch.nan_to_num(p).min()), float(torch.nan_to_num(p).max()))
+                    else:
+                        print("pred:", pred.shape, pred.dtype,
+                            "finite:", bool(torch.isfinite(pred).all()))
+                    #raise RuntimeError("Non-finite loss")
+
             # Backward
             scaler.scale(loss).backward()
+            if DEBUG:
+                # right after loss.backward()
+                name_g, bad_g = first_nonfinite_named((n, p.grad) for n, p in model.named_parameters())
+                if name_g:
+                    print("NON-FINITE GRAD FIRST:", name_g)
+                    print("Non-finite gradients before step")
+
 
             # Optimize - https://pytorch.org/docs/master/notes/amp_examples.html
             if ni - last_opt_step >= accumulate:
                 scaler.unscale_(optimizer)  # unscale gradients
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)  # clip gradients
+
+                if DEBUG:
+                    name_g2, bad_g2 = first_nonfinite_named((n, p.grad) for n, p in model.named_parameters())
+                    if name_g2:
+                        print("NON-FINITE GRAD AFTER CLIP:", name_g2)
+                        print("Non-finite gradients after clip")
+
                 scaler.step(optimizer)  # optimizer.step
                 scaler.update()
                 optimizer.zero_grad()
+                if DEBUG:
+                    if not params_finite(de_parallel(model) if hasattr(model, "module") else model):
+                        print("Weights became non-finite right after optimizer step")
+                    
                 if ema:
                     ema.update(model)
                 last_opt_step = ni
@@ -468,6 +572,7 @@ def train(hyp, opt, device, callbacks):
                     plots=False,
                     callbacks=callbacks,
                     compute_loss=compute_loss,
+                    wavelet_parameters=wavelet_parameters,
                 )
 
             # Update best mAP
@@ -533,6 +638,7 @@ def train(hyp, opt, device, callbacks):
                         plots=plots,
                         callbacks=callbacks,
                         compute_loss=compute_loss,
+                        wavelet_parameters=wavelet_parameters,
                     )  # val best model with plots
                     if is_coco:
                         callbacks.run("on_fit_epoch_end", list(mloss) + list(results) + lr, epoch, best_fitness, fi)
@@ -614,6 +720,9 @@ def parse_opt(known=False):
     parser.add_argument("--ndjson-console", action="store_true", help="Log ndjson to console")
     parser.add_argument("--ndjson-file", action="store_true", help="Log ndjson to file")
 
+    #IRMA custom
+    parser.add_argument("--wavelet", action="store_true", help="use wavelets")
+    parser.add_argument("--lr_user", type=float, default=0.01, help="learning rate")
     return parser.parse_known_args()[0] if known else parser.parse_args()
 
 

@@ -3,10 +3,13 @@
 
 import torch
 import torch.nn as nn
+import sys
+sys.path.insert(0,"/workspace/my_model/")
 
 from utils.metrics import bbox_iou
 from utils.torch_utils import de_parallel
 
+import src.utils.sIoU as sIoU
 
 def smooth_BCE(eps=0.1):
     """Returns label smoothing BCE targets for reducing overfitting; pos: `1.0 - 0.5*eps`, neg: `0.5*eps`. For details
@@ -158,7 +161,12 @@ class ComputeLoss:
                 pxy = pxy.sigmoid() * 2 - 0.5
                 pwh = (pwh.sigmoid() * 2) ** 2 * anchors[i]
                 pbox = torch.cat((pxy, pwh), 1)  # predicted box
-                iou = bbox_iou(pbox, tbox[i], CIoU=True).squeeze()  # iou(prediction, target)
+                iou_yolo5 = bbox_iou(pbox, tbox[i], CIoU=True).squeeze()  # iou(prediction, target)
+                siou = sIoU.bbox_siou(pbox, tbox[i]).squeeze()
+                #tmp_iou = sIoU.bbox_iou(pbox, tbox[i]).squeeze()
+                #print(f"{iou[0]} / {tmp_iou[0]} / {siou[0]}\n")
+                sciou = sIoU.bbox_sciou(pbox, tbox[i], xywh=True, gamma=0.2, kappa=64.0, q_floor=1e-4).squeeze()
+                iou = sciou
                 lbox += (1.0 - iou).mean()  # iou loss
 
                 # Objectness
